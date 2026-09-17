@@ -1,0 +1,35 @@
+# Secrets / credentials
+.env
+.env.*
+secrets/
+credentials/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Arduino
+*.bin
+*.hex
+*.elf
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Data generated during experiments
+data/raw/*
+data/processed/*
+
+# Temporary files
+*.tmp
+*.log
