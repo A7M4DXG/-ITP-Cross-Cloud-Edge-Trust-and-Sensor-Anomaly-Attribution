@@ -2,1417 +2,1743 @@
 #include <WiFiClientSecure.h>
 #include <WiFiUdp.h>
 #include <PubSubClient.h>
-
 #include <time.h>
-#include <mbedtls/base64.h>
-#include <mbedtls/md.h>
 
 #include "secrets.h"
 #include "azure_root_ca.h"
 
+#include "mbedtls/base64.h"
+#include "mbedtls/md.h"
 
 // ============================================================
-// Azure MQTT Configuration
+// PROJECT
+// Cross-Cloud Edge Trust and Sensor Anomaly Attribution
+//
+// Device:
+// XIAO ESP32-C3 - Azure Gateway
+//
+// Flow:
+// Sensor Node #1
+//      |
+//      | UDP
+//      v
+// Azure Gateway
+//      |
+//      | MQTT + TLS + SAS
+//      v
+// Azure IoT Hub
+//
+// Phase 2:
+// Formal telemetry + provenance + gateway validation
 // ============================================================
 
-const int MQTT_PORT = 8883;
 
-const char* MQTT_USERNAME =
-    "iot-hub-crosscloud.azure-devices.net/azure-gateway-01/?api-version=2021-04-12";
+// ============================================================
+// WIFI
+// ============================================================
 
-const char* MQTT_TOPIC =
+WiFiClientSecure secureClient;
+PubSubClient mqttClient(secureClient);
+
+
+// ============================================================
+// UDP
+// ============================================================
+
+WiFiUDP udp;
+
+const unsigned int UDP_LISTEN_PORT = 5000;
+
+
+// ============================================================
+// AZURE
+// ============================================================
+
+const char* AZURE_MQTT_TOPIC =
     "devices/azure-gateway-01/messages/events/";
 
 
 // ============================================================
-// Local Sensor Gateway Configuration
+// DEVICE IDENTITIES
 // ============================================================
 
-const unsigned int UDP_PORT = 5000;
+const char* GATEWAY_ID = "azure-gateway-01";
 
-const char* GATEWAY_ID =
-    "azure-gateway-01";
-
-
-// ============================================================
-// Network Clients
-// ============================================================
-
-WiFiClientSecure secureClient;
-
-PubSubClient mqttClient(
-    secureClient
-);
-
-WiFiUDP udp;
+const char* EXPECTED_SENSOR_ID =
+    "sensor-node-01";
 
 
 // ============================================================
-// Sensor Tracking
+// STATE
 // ============================================================
 
-unsigned long receivedPackets = 0;
+unsigned long packetCount = 0;
+
+unsigned long acceptedCount = 0;
+unsigned long rejectedCount = 0;
+
+unsigned long replayCandidateCount = 0;
+unsigned long sequenceGapCount = 0;
 
 unsigned long lastSensorSequence = 0;
 
-unsigned long lastSensorPacketTime = 0;
+bool hasReceivedSequence = false;
 
 
 // ============================================================
-// URL Encode
+// TIME
 // ============================================================
 
-String urlEncode(
-    const String& input
-)
-{
-    const char* hex =
-        "0123456789ABCDEF";
+const char* NTP_SERVER = "pool.ntp.org";
 
-    String output;
+const long GMT_OFFSET_SEC = 0;
+const int DAYLIGHT_OFFSET_SEC = 0;
 
-    for (
-        size_t i = 0;
-        i < input.length();
-        i++
-    )
-    {
-        char c = input[i];
 
-        if (
-            (c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z') ||
-            (c >= '0' && c <= '9') ||
-            c == '-' ||
-            c == '_' ||
-            c == '.' ||
-            c == '~'
-        )
-        {
-            output += c;
-        }
-        else
-        {
-            output += '%';
+// ============================================================
+// HELPER: PRINT SEPARATOR
+// ============================================================
 
-            output += hex[
-                (c >> 4) & 0x0F
-            ];
-
-            output += hex[
-                c & 0x0F
-            ];
-        }
-    }
-
-    return output;
+void printSeparator() {
+  Serial.println("--------------------------------");
 }
 
 
 // ============================================================
-// Generate Azure SAS Token
+// HELPER: GET UTC ISO TIMESTAMP
 // ============================================================
 
-String generateSasToken()
-{
-    const long TOKEN_LIFETIME = 3600;
+String getUtcTimestamp() {
 
-    time_t now =
-        time(nullptr);
+  struct tm timeinfo;
 
-    if (
-        now < 100000
-    )
-    {
-        Serial.println(
-            "ERROR: System time is not synchronized."
-        );
+  if (!getLocalTime(&timeinfo)) {
+    return "TIME_UNAVAILABLE";
+  }
 
-        return "";
-    }
+  char buffer[30];
 
-    time_t expiry =
-        now + TOKEN_LIFETIME;
+  strftime(
+    buffer,
+    sizeof(buffer),
+    "%Y-%m-%dT%H:%M:%SZ",
+    &timeinfo
+  );
 
-
-    // --------------------------------------------------------
-    // Resource URI
-    // --------------------------------------------------------
-
-    String resourceUri =
-        String(AZURE_HUB_HOST) +
-        "/devices/" +
-        AZURE_DEVICE_ID;
-
-
-    String encodedResourceUri =
-        urlEncode(
-            resourceUri
-        );
-
-
-    // --------------------------------------------------------
-    // String to sign
-    // --------------------------------------------------------
-
-    String stringToSign =
-        encodedResourceUri +
-        "\n" +
-        String(
-            (long)expiry
-        );
-
-
-    // --------------------------------------------------------
-    // Decode device key
-    // --------------------------------------------------------
-
-    size_t keyLength = 0;
-
-    unsigned char decodedKey[64];
-
-    int result =
-        mbedtls_base64_decode(
-            decodedKey,
-            sizeof(decodedKey),
-            &keyLength,
-            (const unsigned char*)
-                AZURE_DEVICE_KEY,
-            strlen(
-                AZURE_DEVICE_KEY
-            )
-        );
-
-    if (
-        result != 0
-    )
-    {
-        Serial.println(
-            "ERROR: Failed to decode Azure device key."
-        );
-
-        return "";
-    }
-
-
-    // --------------------------------------------------------
-    // HMAC-SHA256
-    // --------------------------------------------------------
-
-    unsigned char hmacResult[32];
-
-    const mbedtls_md_info_t* mdInfo =
-        mbedtls_md_info_from_type(
-            MBEDTLS_MD_SHA256
-        );
-
-    if (
-        mdInfo == nullptr
-    )
-    {
-        Serial.println(
-            "ERROR: SHA256 unavailable."
-        );
-
-        return "";
-    }
-
-
-    mbedtls_md_context_t ctx;
-
-    mbedtls_md_init(
-        &ctx
-    );
-
-
-    result =
-        mbedtls_md_setup(
-            &ctx,
-            mdInfo,
-            1
-        );
-
-    if (
-        result != 0
-    )
-    {
-        mbedtls_md_free(
-            &ctx
-        );
-
-        return "";
-    }
-
-
-    result =
-        mbedtls_md_hmac_starts(
-            &ctx,
-            decodedKey,
-            keyLength
-        );
-
-    if (
-        result != 0
-    )
-    {
-        mbedtls_md_free(
-            &ctx
-        );
-
-        return "";
-    }
-
-
-    result =
-        mbedtls_md_hmac_update(
-            &ctx,
-            (const unsigned char*)
-                stringToSign.c_str(),
-            stringToSign.length()
-        );
-
-    if (
-        result != 0
-    )
-    {
-        mbedtls_md_free(
-            &ctx
-        );
-
-        return "";
-    }
-
-
-    result =
-        mbedtls_md_hmac_finish(
-            &ctx,
-            hmacResult
-        );
-
-    mbedtls_md_free(
-        &ctx
-    );
-
-
-    if (
-        result != 0
-    )
-    {
-        return "";
-    }
-
-
-    // --------------------------------------------------------
-    // Base64 encode signature
-    // --------------------------------------------------------
-
-    unsigned char encodedSignature[64];
-
-    size_t encodedLength = 0;
-
-    result =
-        mbedtls_base64_encode(
-            encodedSignature,
-            sizeof(encodedSignature) - 1,
-            &encodedLength,
-            hmacResult,
-            sizeof(hmacResult)
-        );
-
-    if (
-        result != 0
-    )
-    {
-        return "";
-    }
-
-    encodedSignature[
-        encodedLength
-    ] = '\0';
-
-
-    // --------------------------------------------------------
-    // URL encode signature
-    // --------------------------------------------------------
-
-    String signature =
-        urlEncode(
-            String(
-                (char*)encodedSignature
-            )
-        );
-
-
-    // --------------------------------------------------------
-    // Construct SAS token
-    // --------------------------------------------------------
-
-    String token =
-        "SharedAccessSignature sr=" +
-        encodedResourceUri +
-        "&sig=" +
-        signature +
-        "&se=" +
-        String(
-            (long)expiry
-        );
-
-
-    return token;
+  return String(buffer);
 }
 
 
 // ============================================================
-// Connect Wi-Fi
+// HELPER: URL ENCODE
 // ============================================================
 
-void connectWiFi()
-{
+String urlEncode(const String& input) {
+
+  String encoded = "";
+
+  const char* hex = "0123456789ABCDEF";
+
+  for (size_t i = 0; i < input.length(); i++) {
+
+    char c = input.charAt(i);
+
+    if (
+      (c >= 'a' && c <= 'z') ||
+      (c >= 'A' && c <= 'Z') ||
+      (c >= '0' && c <= '9') ||
+      c == '-' ||
+      c == '_' ||
+      c == '.' ||
+      c == '~'
+    ) {
+
+      encoded += c;
+
+    } else {
+
+      encoded += '%';
+      encoded += hex[(c >> 4) & 0x0F];
+      encoded += hex[c & 0x0F];
+    }
+  }
+
+  return encoded;
+}
+
+
+// ============================================================
+// HELPER: BASE64 ENCODE
+// ============================================================
+
+String base64Encode(
+  const unsigned char* input,
+  size_t inputLength
+) {
+
+  size_t outputLength = 0;
+
+  size_t bufferLength =
+      ((inputLength + 2) / 3) * 4 + 1;
+
+  unsigned char* output =
+      new unsigned char[bufferLength];
+
+  if (output == nullptr) {
+    return "";
+  }
+
+  int result = mbedtls_base64_encode(
+    output,
+    bufferLength,
+    &outputLength,
+    input,
+    inputLength
+  );
+
+  if (result != 0) {
+    delete[] output;
+    return "";
+  }
+
+  output[outputLength] = '\0';
+
+  String encoded =
+      String((char*)output);
+
+  delete[] output;
+
+  return encoded;
+}
+
+
+// ============================================================
+// HELPER: BASE64 DECODE
+// ============================================================
+
+bool base64Decode(
+  const String& input,
+  unsigned char* output,
+  size_t outputSize,
+  size_t& decodedLength
+) {
+
+  int result = mbedtls_base64_decode(
+    output,
+    outputSize,
+    &decodedLength,
+    (const unsigned char*)input.c_str(),
+    input.length()
+  );
+
+  return result == 0;
+}
+
+
+// ============================================================
+// HELPER: HMAC-SHA256
+// ============================================================
+
+bool calculateHmacSha256(
+  const unsigned char* key,
+  size_t keyLength,
+  const unsigned char* data,
+  size_t dataLength,
+  unsigned char* output
+) {
+
+  const mbedtls_md_info_t* mdInfo =
+      mbedtls_md_info_from_type(
+        MBEDTLS_MD_SHA256
+      );
+
+  if (mdInfo == nullptr) {
+    return false;
+  }
+
+  int result = mbedtls_md_hmac(
+    mdInfo,
+    key,
+    keyLength,
+    data,
+    dataLength,
+    output
+  );
+
+  return result == 0;
+}
+
+
+// ============================================================
+// GENERATE AZURE SAS TOKEN
+// ============================================================
+
+String generateSasToken() {
+
+  Serial.println("Generating SAS token...");
+
+  String resourceUri =
+      String(AZURE_HUB_HOST) +
+      "/devices/" +
+      String(AZURE_DEVICE_ID);
+
+  String encodedResourceUri =
+      urlEncode(resourceUri);
+
+  unsigned long expiry =
+      (unsigned long)time(nullptr) + 3600;
+
+  String stringToSign =
+      encodedResourceUri +
+      "\n" +
+      String(expiry);
+
+  unsigned char decodedKey[128];
+
+  size_t decodedKeyLength = 0;
+
+  if (!base64Decode(
+        String(AZURE_DEVICE_KEY),
+        decodedKey,
+        sizeof(decodedKey),
+        decodedKeyLength
+      )) {
+
+    Serial.println(
+      "ERROR: Failed to decode Azure device key."
+    );
+
+    return "";
+  }
+
+  unsigned char hmacResult[32];
+
+  if (!calculateHmacSha256(
+        decodedKey,
+        decodedKeyLength,
+        (const unsigned char*)stringToSign.c_str(),
+        stringToSign.length(),
+        hmacResult
+      )) {
+
+    Serial.println(
+      "ERROR: HMAC-SHA256 calculation failed."
+    );
+
+    return "";
+  }
+
+  String encodedSignature =
+      base64Encode(
+        hmacResult,
+        sizeof(hmacResult)
+      );
+
+  if (encodedSignature.length() == 0) {
+
+    Serial.println(
+      "ERROR: Failed to encode SAS signature."
+    );
+
+    return "";
+  }
+
+  String encodedSignatureUrl =
+      urlEncode(encodedSignature);
+
+  String sasToken =
+      "SharedAccessSignature sr=" +
+      encodedResourceUri +
+      "&sig=" +
+      encodedSignatureUrl +
+      "&se=" +
+      String(expiry);
+
+  Serial.println("SAS token generated.");
+
+  return sasToken;
+}
+
+
+// ============================================================
+// CONNECT TO AZURE MQTT
+// ============================================================
+
+bool connectToAzure() {
+
+  if (mqttClient.connected()) {
+    return true;
+  }
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("   CONNECTING TO AZURE MQTT");
+  Serial.println("================================");
+
+  Serial.print("Host: ");
+  Serial.println(AZURE_HUB_HOST);
+
+  Serial.print("Port: ");
+  Serial.println(8883);
+
+  Serial.print("Device ID: ");
+  Serial.println(AZURE_DEVICE_ID);
+
+  Serial.println();
+
+  String sasToken =
+      generateSasToken();
+
+  if (sasToken.length() == 0) {
+    return false;
+  }
+
+  String username =
+      String(AZURE_HUB_HOST) +
+      "/" +
+      String(AZURE_DEVICE_ID) +
+      "/?api-version=2021-04-12";
+
+  String clientId =
+      String(AZURE_DEVICE_ID);
+
+  Serial.println("Connecting MQTT...");
+
+  bool connected =
+      mqttClient.connect(
+        clientId.c_str(),
+        username.c_str(),
+        sasToken.c_str()
+      );
+
+  if (connected) {
+
     Serial.println();
-    Serial.println(
-        "================================"
-    );
+    Serial.println("================================");
+    Serial.println("   AZURE MQTT CONNECTED!");
+    Serial.println("================================");
 
-    Serial.println(
-        "     AZURE GATEWAY ESP32-C3"
-    );
+    Serial.println();
+    Serial.println("Device authentication: PASS");
+    Serial.println("MQTT connection: PASS");
 
-    Serial.println(
-        "================================"
-    );
+    return true;
 
-
-    WiFi.mode(
-        WIFI_STA
-    );
-
-
-    WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD
-    );
-
+  } else {
 
     Serial.print(
-        "Connecting to Wi-Fi"
+      "Azure MQTT connection FAILED. MQTT state: "
     );
-
-
-    int attempts = 0;
-
-
-    while (
-        WiFi.status() != WL_CONNECTED &&
-        attempts < 30
-    )
-    {
-        delay(500);
-
-        Serial.print(
-            "."
-        );
-
-        attempts++;
-    }
-
-
-    Serial.println();
-
-
-    if (
-        WiFi.status() == WL_CONNECTED
-    )
-    {
-        Serial.println(
-            "Wi-Fi connected!"
-        );
-
-        Serial.print(
-            "Gateway IP: "
-        );
-
-        Serial.println(
-            WiFi.localIP()
-        );
-
-        Serial.print(
-            "Signal strength: "
-        );
-
-        Serial.print(
-            WiFi.RSSI()
-        );
-
-        Serial.println(
-            " dBm"
-        );
-    }
-    else
-    {
-        Serial.println(
-            "Wi-Fi connection FAILED."
-        );
-    }
-
 
     Serial.println(
-        "-------------------------------"
+      mqttClient.state()
     );
-}
-
-
-// ============================================================
-// Synchronize Time
-// ============================================================
-
-bool synchronizeTime()
-{
-    Serial.println();
-    Serial.println(
-        "Synchronizing time..."
-    );
-
-
-    configTime(
-        0,
-        0,
-        "pool.ntp.org",
-        "time.nist.gov"
-    );
-
-
-    time_t now =
-        time(nullptr);
-
-
-    int attempts = 0;
-
-
-    while (
-        now < 100000 &&
-        attempts < 30
-    )
-    {
-        delay(500);
-
-        Serial.print(
-            "."
-        );
-
-        now =
-            time(nullptr);
-
-        attempts++;
-    }
-
-
-    Serial.println();
-
-
-    if (
-        now > 100000
-    )
-    {
-        Serial.println(
-            "Time synchronized."
-        );
-
-
-        struct tm timeinfo;
-
-
-        gmtime_r(
-            &now,
-            &timeinfo
-        );
-
-
-        Serial.printf(
-            "UTC time: %04d-%02d-%02d %02d:%02d:%02d\n",
-            timeinfo.tm_year + 1900,
-            timeinfo.tm_mon + 1,
-            timeinfo.tm_mday,
-            timeinfo.tm_hour,
-            timeinfo.tm_min,
-            timeinfo.tm_sec
-        );
-
-
-        Serial.println(
-            "-------------------------------"
-        );
-
-
-        return true;
-    }
-
-
-    Serial.println(
-        "WARNING: Time synchronization failed."
-    );
-
 
     return false;
+  }
 }
 
 
 // ============================================================
-// MQTT Callback
+// EXTRACT STRING FIELD
+//
+// Simple parser intentionally used instead of ArduinoJson so
+// the gateway does not require an additional library.
 // ============================================================
 
-void mqttCallback(
-    char* topic,
-    byte* payload,
-    unsigned int length
-)
-{
-    Serial.println();
-    Serial.println(
-        "MQTT message received."
-    );
+bool extractStringField(
+  const String& json,
+  const String& field,
+  String& value
+) {
 
-    Serial.print(
-        "Topic: "
-    );
+  String key =
+      "\"" + field + "\"";
 
-    Serial.println(
-        topic
-    );
+  int keyPosition =
+      json.indexOf(key);
+
+  if (keyPosition < 0) {
+    return false;
+  }
+
+  int colonPosition =
+      json.indexOf(
+        ':',
+        keyPosition + key.length()
+      );
+
+  if (colonPosition < 0) {
+    return false;
+  }
+
+  int firstQuote =
+      json.indexOf(
+        '"',
+        colonPosition + 1
+      );
+
+  if (firstQuote < 0) {
+    return false;
+  }
+
+  int secondQuote =
+      json.indexOf(
+        '"',
+        firstQuote + 1
+      );
+
+  if (secondQuote < 0) {
+    return false;
+  }
+
+  value =
+      json.substring(
+        firstQuote + 1,
+        secondQuote
+      );
+
+  return true;
 }
 
 
 // ============================================================
-// Connect Azure MQTT
+// EXTRACT UNSIGNED LONG FIELD
 // ============================================================
 
-bool connectAzure()
-{
-    Serial.println();
-    Serial.println(
-        "================================"
-    );
+bool extractUnsignedLongField(
+  const String& json,
+  const String& field,
+  unsigned long& value
+) {
 
-    Serial.println(
-        "   CONNECTING TO AZURE MQTT"
-    );
+  String key =
+      "\"" + field + "\"";
 
-    Serial.println(
-        "================================"
-    );
+  int keyPosition =
+      json.indexOf(key);
+
+  if (keyPosition < 0) {
+    return false;
+  }
+
+  int colonPosition =
+      json.indexOf(
+        ':',
+        keyPosition + key.length()
+      );
+
+  if (colonPosition < 0) {
+    return false;
+  }
+
+  int start =
+      colonPosition + 1;
+
+  while (
+    start < (int)json.length() &&
+    (
+      json.charAt(start) == ' ' ||
+      json.charAt(start) == '\t'
+    )
+  ) {
+    start++;
+  }
+
+  int end = start;
+
+  while (
+    end < (int)json.length() &&
+    isDigit(json.charAt(end))
+  ) {
+    end++;
+  }
+
+  if (end == start) {
+    return false;
+  }
+
+  String number =
+      json.substring(start, end);
+
+  value =
+      strtoul(
+        number.c_str(),
+        nullptr,
+        10
+      );
+
+  return true;
+}
 
 
-    // --------------------------------------------------------
-    // TLS
-    // --------------------------------------------------------
+// ============================================================
+// EXTRACT FLOAT FIELD
+// ============================================================
 
-    secureClient.setCACert(
-        AZURE_ROOT_CA
-    );
+bool extractFloatField(
+  const String& json,
+  const String& field,
+  float& value
+) {
 
-    secureClient.setTimeout(
-        10000
-    );
+  String key =
+      "\"" + field + "\"";
 
+  int keyPosition =
+      json.indexOf(key);
 
-    // --------------------------------------------------------
-    // MQTT
-    // --------------------------------------------------------
+  if (keyPosition < 0) {
+    return false;
+  }
 
-    mqttClient.setServer(
-        AZURE_HUB_HOST,
-        MQTT_PORT
-    );
+  int colonPosition =
+      json.indexOf(
+        ':',
+        keyPosition + key.length()
+      );
 
-    mqttClient.setCallback(
-        mqttCallback
-    );
+  if (colonPosition < 0) {
+    return false;
+  }
 
-    mqttClient.setKeepAlive(
-        60
-    );
+  int start =
+      colonPosition + 1;
 
-    mqttClient.setBufferSize(
-        1024
-    );
+  while (
+    start < (int)json.length() &&
+    (
+      json.charAt(start) == ' ' ||
+      json.charAt(start) == '\t'
+    )
+  ) {
+    start++;
+  }
 
+  int end = start;
 
-    // --------------------------------------------------------
-    // SAS
-    // --------------------------------------------------------
+  while (
+    end < (int)json.length()
+  ) {
 
-    Serial.println();
-
-    Serial.println(
-        "Generating SAS token..."
-    );
-
-
-    String sasToken =
-        generateSasToken();
-
+    char c =
+        json.charAt(end);
 
     if (
-        sasToken.length() == 0
-    )
-    {
-        Serial.println(
-            "SAS token generation FAILED."
-        );
+      isDigit(c) ||
+      c == '-' ||
+      c == '+' ||
+      c == '.' ||
+      c == 'e' ||
+      c == 'E'
+    ) {
 
-        return false;
+      end++;
+
+    } else {
+
+      break;
     }
+  }
+
+  if (end == start) {
+    return false;
+  }
+
+  String number =
+      json.substring(start, end);
+
+  value =
+      number.toFloat();
+
+  return true;
+}
 
 
-    Serial.println(
-        "SAS token generated."
-    );
+// ============================================================
+// VALIDATE SENSOR MESSAGE
+// ============================================================
+
+bool validateSensorMessage(
+  const String& payload,
+
+  String& sourceId,
+  unsigned long& sequence,
+  unsigned long& uptimeMs,
+
+  float& temperature,
+  float& humidity,
+
+  String& sequenceStatus,
+  String& measurementStatus,
+  String& overallStatus
+) {
+
+  // ----------------------------------------------------------
+  // Extract required fields
+  // ----------------------------------------------------------
+
+  bool sourceOk =
+      extractStringField(
+        payload,
+        "source_id",
+        sourceId
+      );
+
+  bool sequenceOk =
+      extractUnsignedLongField(
+        payload,
+        "sequence",
+        sequence
+      );
+
+  bool uptimeOk =
+      extractUnsignedLongField(
+        payload,
+        "uptime_ms",
+        uptimeMs
+      );
+
+  bool temperatureOk =
+      extractFloatField(
+        payload,
+        "temperature",
+        temperature
+      );
+
+  bool humidityOk =
+      extractFloatField(
+        payload,
+        "humidity",
+        humidity
+      );
 
 
-    // --------------------------------------------------------
-    // MQTT CONNECT
-    // --------------------------------------------------------
+  // ----------------------------------------------------------
+  // Required field validation
+  // ----------------------------------------------------------
 
-    Serial.println();
+  if (
+    !sourceOk ||
+    !sequenceOk ||
+    !uptimeOk ||
+    !temperatureOk ||
+    !humidityOk
+  ) {
 
-    Serial.println(
-        "Connecting MQTT..."
-    );
+    sequenceStatus =
+        "INVALID";
 
+    measurementStatus =
+        "INVALID";
 
-    Serial.print(
-        "Host: "
-    );
-
-    Serial.println(
-        AZURE_HUB_HOST
-    );
-
-
-    Serial.print(
-        "Port: "
-    );
-
-    Serial.println(
-        MQTT_PORT
-    );
-
-
-    Serial.print(
-        "Device ID: "
-    );
-
-    Serial.println(
-        AZURE_DEVICE_ID
-    );
-
-
-    bool connected =
-        mqttClient.connect(
-            AZURE_DEVICE_ID,
-            MQTT_USERNAME,
-            sasToken.c_str()
-        );
-
-
-    if (
-        connected
-    )
-    {
-        Serial.println();
-        Serial.println(
-            "================================"
-        );
-
-        Serial.println(
-            "   AZURE MQTT CONNECTED!"
-        );
-
-        Serial.println(
-            "================================"
-        );
-
-
-        Serial.println();
-        Serial.println(
-            "Device authentication: PASS"
-        );
-
-        Serial.println(
-            "MQTT connection: PASS"
-        );
-
-
-        return true;
-    }
-
-
-    Serial.println();
-    Serial.println(
-        "================================"
-    );
-
-    Serial.println(
-        "   AZURE MQTT CONNECTION FAILED"
-    );
-
-    Serial.println(
-        "================================"
-    );
-
-
-    Serial.print(
-        "MQTT state: "
-    );
-
-    Serial.println(
-        mqttClient.state()
-    );
-
+    overallStatus =
+        "MALFORMED";
 
     return false;
+  }
+
+
+  // ----------------------------------------------------------
+  // Source identity validation
+  // ----------------------------------------------------------
+
+  bool sourceValid =
+      (sourceId == EXPECTED_SENSOR_ID);
+
+
+  // ----------------------------------------------------------
+  // Measurement validation
+  //
+  // DHT11:
+  // Temperature: -40 to 80 C used as broad validity range
+  // Humidity: 0 to 100 %
+  // ----------------------------------------------------------
+
+  bool temperatureValid =
+      (
+        temperature >= -40.0 &&
+        temperature <= 80.0
+      );
+
+  bool humidityValid =
+      (
+        humidity >= 0.0 &&
+        humidity <= 100.0
+      );
+
+  bool measurementValid =
+      temperatureValid &&
+      humidityValid;
+
+
+  // ----------------------------------------------------------
+  // Sequence validation
+  // ----------------------------------------------------------
+
+  if (!hasReceivedSequence) {
+
+    sequenceStatus =
+        "FIRST";
+
+  } else if (
+    sequence <= lastSensorSequence
+  ) {
+
+    sequenceStatus =
+        "REPLAY_OR_DUPLICATE";
+
+  } else if (
+    sequence > lastSensorSequence + 1
+  ) {
+
+    sequenceStatus =
+        "SEQUENCE_GAP";
+
+  } else {
+
+    sequenceStatus =
+        "NORMAL";
+  }
+
+
+  // ----------------------------------------------------------
+  // Measurement status
+  // ----------------------------------------------------------
+
+  if (measurementValid) {
+
+    measurementStatus =
+        "NORMAL";
+
+  } else {
+
+    measurementStatus =
+        "OUT_OF_RANGE";
+  }
+
+
+  // ----------------------------------------------------------
+  // Overall classification
+  // ----------------------------------------------------------
+
+  if (!sourceValid) {
+
+    overallStatus =
+        "UNEXPECTED_SOURCE";
+
+  } else if (!measurementValid) {
+
+    overallStatus =
+        "MEASUREMENT_ANOMALY";
+
+  } else if (
+    sequenceStatus ==
+    "REPLAY_OR_DUPLICATE"
+  ) {
+
+    overallStatus =
+        "REPLAY_CANDIDATE";
+
+  } else if (
+    sequenceStatus ==
+    "SEQUENCE_GAP"
+  ) {
+
+    overallStatus =
+        "SEQUENCE_GAP";
+
+  } else {
+
+    overallStatus =
+        "ACCEPTED";
+  }
+
+
+  // ----------------------------------------------------------
+  // Return whether message structure is valid
+  // ----------------------------------------------------------
+
+  return true;
 }
 
 
 // ============================================================
-// Start UDP Sensor Receiver
+// BUILD FORMAL PROVENANCE PAYLOAD
 // ============================================================
 
-void startUDP()
-{
+String buildAzurePayload(
+  const String& sourceId,
+  unsigned long sequence,
+  unsigned long uptimeMs,
+
+  float temperature,
+  float humidity,
+
+  const String& gatewayTimestamp,
+  const String& sourceIp,
+
+  const String& sequenceStatus,
+  const String& measurementStatus,
+  const String& overallStatus
+) {
+
+  String payload = "";
+
+  payload += "{";
+
+  // ----------------------------------------------------------
+  // Schema
+  // ----------------------------------------------------------
+
+  payload +=
+      "\"schema_version\":\"1.0\",";
+
+
+  // ----------------------------------------------------------
+  // Sensor-generated provenance
+  // ----------------------------------------------------------
+
+  payload += "\"source\":{";
+
+  payload +=
+      "\"device_id\":\"" +
+      sourceId +
+      "\",";
+
+  payload +=
+      "\"sequence\":" +
+      String(sequence) +
+      ",";
+
+  payload +=
+      "\"uptime_ms\":" +
+      String(uptimeMs);
+
+  payload += "},";
+
+
+  // ----------------------------------------------------------
+  // Sensor measurements
+  // ----------------------------------------------------------
+
+  payload += "\"measurement\":{";
+
+  payload +=
+      "\"temperature\":" +
+      String(temperature, 2) +
+      ",";
+
+  payload +=
+      "\"humidity\":" +
+      String(humidity, 2);
+
+  payload += "},";
+
+
+  // ----------------------------------------------------------
+  // Gateway-observed provenance
+  // ----------------------------------------------------------
+
+  payload += "\"gateway\":{";
+
+  payload +=
+      "\"device_id\":\"" +
+      String(GATEWAY_ID) +
+      "\",";
+
+  payload +=
+      "\"received_at\":\"" +
+      gatewayTimestamp +
+      "\",";
+
+  payload +=
+      "\"source_ip\":\"" +
+      sourceIp +
+      "\"";
+
+  payload += "},";
+
+
+  // ----------------------------------------------------------
+  // Validation / attribution
+  // ----------------------------------------------------------
+
+  payload += "\"validation\":{";
+
+  payload +=
+      "\"sequence_status\":\"" +
+      sequenceStatus +
+      "\",";
+
+  payload +=
+      "\"measurement_status\":\"" +
+      measurementStatus +
+      "\",";
+
+  payload +=
+      "\"overall_status\":\"" +
+      overallStatus +
+      "\"";
+
+  payload += "}";
+
+
+  payload += "}";
+
+  return payload;
+}
+
+
+// ============================================================
+// RECEIVE SENSOR DATA
+// ============================================================
+
+void receiveSensorData() {
+
+  int packetSize =
+      udp.parsePacket();
+
+  if (packetSize <= 0) {
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Read packet
+  // ----------------------------------------------------------
+
+  char incomingPacket[512];
+
+  int len =
+      udp.read(
+        incomingPacket,
+        sizeof(incomingPacket) - 1
+      );
+
+  if (len <= 0) {
+    return;
+  }
+
+  incomingPacket[len] =
+      '\0';
+
+  String sensorPayload =
+      String(incomingPacket);
+
+
+  packetCount++;
+
+
+  // ----------------------------------------------------------
+  // Source network information
+  // ----------------------------------------------------------
+
+  IPAddress sourceIpAddress =
+      udp.remoteIP();
+
+  unsigned int sourcePort =
+      udp.remotePort();
+
+  String sourceIp =
+      sourceIpAddress.toString();
+
+
+  // ----------------------------------------------------------
+  // Display received data
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println("================================");
+  Serial.println("    SENSOR DATA RECEIVED");
+  Serial.println("================================");
+
+  Serial.print("Source IP: ");
+  Serial.println(sourceIp);
+
+  Serial.print("Source port: ");
+  Serial.println(sourcePort);
+
+  Serial.print("Packet number: ");
+  Serial.println(packetCount);
+
+  Serial.print("Raw sensor payload: ");
+  Serial.println(sensorPayload);
+
+  printSeparator();
+
+
+  // ----------------------------------------------------------
+  // Parse and validate
+  // ----------------------------------------------------------
+
+  String sourceId = "";
+
+  unsigned long sequence = 0;
+
+  unsigned long uptimeMs = 0;
+
+  float temperature = 0.0;
+
+  float humidity = 0.0;
+
+  String sequenceStatus = "";
+
+  String measurementStatus = "";
+
+  String overallStatus = "";
+
+
+  bool structureValid =
+      validateSensorMessage(
+        sensorPayload,
+
+        sourceId,
+        sequence,
+        uptimeMs,
+
+        temperature,
+        humidity,
+
+        sequenceStatus,
+        measurementStatus,
+        overallStatus
+      );
+
+
+  // ----------------------------------------------------------
+  // Display validation
+  // ----------------------------------------------------------
+
+  Serial.println("VALIDATION");
+
+  Serial.print("Source ID: ");
+  Serial.println(sourceId);
+
+  Serial.print("Expected source: ");
+  Serial.println(EXPECTED_SENSOR_ID);
+
+  Serial.print("Sequence: ");
+  Serial.println(sequence);
+
+  Serial.print("Sequence status: ");
+  Serial.println(sequenceStatus);
+
+  Serial.print("Temperature: ");
+  Serial.println(temperature, 2);
+
+  Serial.print("Humidity: ");
+  Serial.println(humidity, 2);
+
+  Serial.print("Measurement status: ");
+  Serial.println(measurementStatus);
+
+  Serial.print("Overall status: ");
+  Serial.println(overallStatus);
+
+  printSeparator();
+
+
+  // ----------------------------------------------------------
+  // Malformed message
+  // ----------------------------------------------------------
+
+  if (!structureValid) {
+
+    rejectedCount++;
+
+    Serial.println(
+      "MESSAGE REJECTED"
+    );
+
+    Serial.println(
+      "Reason: malformed or incomplete sensor payload."
+    );
+
+    Serial.print(
+      "Rejected count: "
+    );
+
+    Serial.println(
+      rejectedCount
+    );
+
+    printSeparator();
+
+    return;
+  }
+
+
+  // ----------------------------------------------------------
+  // Sequence tracking
+  // ----------------------------------------------------------
+
+  if (
+    sequenceStatus ==
+    "REPLAY_OR_DUPLICATE"
+  ) {
+
+    replayCandidateCount++;
+
+    Serial.println(
+      "WARNING: Replay/duplicate candidate detected."
+    );
+
+  } else if (
+    sequenceStatus ==
+    "SEQUENCE_GAP"
+  ) {
+
+    sequenceGapCount++;
+
+    Serial.println(
+      "WARNING: Sequence gap detected."
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Update latest sequence
+  // ----------------------------------------------------------
+
+  if (
+    !hasReceivedSequence ||
+    sequence > lastSensorSequence
+  ) {
+
+    lastSensorSequence =
+        sequence;
+
+    hasReceivedSequence =
+        true;
+  }
+
+
+  // ----------------------------------------------------------
+  // Build formal provenance payload
+  // ----------------------------------------------------------
+
+  String gatewayTimestamp =
+      getUtcTimestamp();
+
+
+  String azurePayload =
+      buildAzurePayload(
+        sourceId,
+        sequence,
+        uptimeMs,
+
+        temperature,
+        humidity,
+
+        gatewayTimestamp,
+        sourceIp,
+
+        sequenceStatus,
+        measurementStatus,
+        overallStatus
+      );
+
+
+  // ----------------------------------------------------------
+  // Display final payload
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "    FORMAL PROVENANCE PAYLOAD"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    azurePayload
+  );
+
+  printSeparator();
+
+
+  // ----------------------------------------------------------
+  // Connect to Azure if required
+  // ----------------------------------------------------------
+
+  if (!mqttClient.connected()) {
+
+    Serial.println(
+      "Azure MQTT is not connected."
+    );
+
+    if (!connectToAzure()) {
+
+      rejectedCount++;
+
+      Serial.println(
+        "Message not published."
+      );
+
+      return;
+    }
+  }
+
+
+  // ----------------------------------------------------------
+  // Publish
+  // ----------------------------------------------------------
+
+  Serial.println();
+  Serial.println(
+    "Publishing to Azure..."
+  );
+
+  bool published =
+      mqttClient.publish(
+        AZURE_MQTT_TOPIC,
+        azurePayload.c_str()
+      );
+
+
+  if (published) {
+
+    acceptedCount++;
+
+    Serial.println();
+    Serial.println(
+      "================================"
+    );
+
+    Serial.println(
+      " SENSOR → GATEWAY → AZURE PASS"
+    );
+
+    Serial.println(
+      "================================"
+    );
+
+    Serial.println(
+      "Sensor data received."
+    );
+
+    Serial.println(
+      "Provenance validated."
+    );
+
+    Serial.println(
+      "Gateway metadata added."
+    );
+
+    Serial.println(
+      "Sensor data published to Azure."
+    );
+
+    Serial.print(
+      "Accepted/published count: "
+    );
+
+    Serial.println(
+      acceptedCount
+    );
+
+  } else {
+
+    rejectedCount++;
+
+    Serial.println();
+    Serial.println(
+      "================================"
+    );
+
+    Serial.println(
+      " AZURE PUBLISH FAILED"
+    );
+
+    Serial.println(
+      "================================"
+    );
+
+    Serial.print(
+      "MQTT state: "
+    );
+
+    Serial.println(
+      mqttClient.state()
+    );
+  }
+
+
+  // ----------------------------------------------------------
+  // Statistics
+  // ----------------------------------------------------------
+
+  Serial.println();
+
+  Serial.println(
+    "GATEWAY STATISTICS"
+  );
+
+  Serial.print(
+    "Packets received: "
+  );
+
+  Serial.println(
+    packetCount
+  );
+
+  Serial.print(
+    "Published: "
+  );
+
+  Serial.println(
+    acceptedCount
+  );
+
+  Serial.print(
+    "Rejected: "
+  );
+
+  Serial.println(
+    rejectedCount
+  );
+
+  Serial.print(
+    "Replay candidates: "
+  );
+
+  Serial.println(
+    replayCandidateCount
+  );
+
+  Serial.print(
+    "Sequence gaps: "
+  );
+
+  Serial.println(
+    sequenceGapCount
+  );
+
+  printSeparator();
+}
+
+
+// ============================================================
+// CONNECT WIFI
+// ============================================================
+
+void connectWiFi() {
+
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  Serial.println();
+  Serial.println(
+    "Connecting to Wi-Fi..."
+  );
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.begin(
+    WIFI_SSID,
+    WIFI_PASSWORD
+  );
+
+  int attempts = 0;
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    attempts < 40
+  ) {
+
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+
+    Serial.println(
+      "Wi-Fi connected!"
+    );
+
+    Serial.print(
+      "Gateway IP: "
+    );
+
+    Serial.println(
+      WiFi.localIP()
+    );
+
+    Serial.print(
+      "Signal strength: "
+    );
+
+    Serial.print(
+      WiFi.RSSI()
+    );
+
+    Serial.println(
+      " dBm"
+    );
+
+    printSeparator();
+
+  } else {
+
+    Serial.println(
+      "Wi-Fi connection FAILED."
+    );
+  }
+}
+
+
+// ============================================================
+// TIME SYNCHRONIZATION
+// ============================================================
+
+void synchronizeTime() {
+
+  Serial.println();
+  Serial.println(
+    "Synchronizing time..."
+  );
+
+  configTime(
+    GMT_OFFSET_SEC,
+    DAYLIGHT_OFFSET_SEC,
+    NTP_SERVER
+  );
+
+  struct tm timeinfo;
+
+  int attempts = 0;
+
+  while (
+    !getLocalTime(&timeinfo) &&
+    attempts < 30
+  ) {
+
+    delay(500);
+
+    Serial.print(".");
+
+    attempts++;
+  }
+
+  Serial.println();
+
+  if (getLocalTime(&timeinfo)) {
+
+    Serial.println(
+      "Time synchronized."
+    );
+
+    Serial.print(
+      "UTC time: "
+    );
+
+    Serial.println(
+      getUtcTimestamp()
+    );
+
+    printSeparator();
+
+  } else {
+
+    Serial.println(
+      "WARNING: Time synchronization failed."
+    );
+  }
+}
+
+
+// ============================================================
+// SETUP
+// ============================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  delay(2000);
+
+  Serial.println();
+  Serial.println();
+  Serial.println(
+    "################################"
+  );
+
+  Serial.println(
+    "# Cross-Cloud Edge Trust"
+  );
+
+  Serial.println(
+    "# Azure Gateway - XIAO ESP32-C3"
+  );
+
+  Serial.println(
+    "# Phase 2: Provenance + Validation"
+  );
+
+  Serial.println(
+    "################################"
+  );
+
+
+  // ----------------------------------------------------------
+  // Wi-Fi
+  // ----------------------------------------------------------
+
+  connectWiFi();
+
+
+  // ----------------------------------------------------------
+  // TLS
+  // ----------------------------------------------------------
+
+  secureClient.setCACert(
+    AZURE_ROOT_CA
+  );
+
+
+  // ----------------------------------------------------------
+  // MQTT
+  // ----------------------------------------------------------
+
+  mqttClient.setServer(
+    AZURE_HUB_HOST,
+    8883
+  );
+
+
+  // ----------------------------------------------------------
+  // MQTT buffer
+  // ----------------------------------------------------------
+
+  mqttClient.setBufferSize(
+    1024
+  );
+
+
+  // ----------------------------------------------------------
+  // Time
+  // ----------------------------------------------------------
+
+  synchronizeTime();
+
+
+  // ----------------------------------------------------------
+  // UDP
+  // ----------------------------------------------------------
+
+  Serial.println(
+    "Starting UDP listener..."
+  );
+
+  if (
     udp.begin(
-        UDP_PORT
-    );
-
-
-    Serial.println();
-    Serial.println(
-        "================================"
-    );
+      UDP_LISTEN_PORT
+    )
+  ) {
 
     Serial.println(
-        "      SENSOR UDP RECEIVER"
+      "UDP listener started."
     );
-
-    Serial.println(
-        "================================"
-    );
-
 
     Serial.print(
-        "Listening on UDP port: "
+      "Listening on port: "
     );
 
     Serial.println(
-        UDP_PORT
+      UDP_LISTEN_PORT
     );
 
-
-    Serial.print(
-        "Gateway IP: "
-    );
+  } else {
 
     Serial.println(
-        WiFi.localIP()
+      "ERROR: UDP initialization failed."
     );
+  }
 
 
-    Serial.println(
-        "Waiting for Sensor Node #1..."
-    );
+  // ----------------------------------------------------------
+  // Azure
+  // ----------------------------------------------------------
+
+  connectToAzure();
 
 
-    Serial.println(
-        "-------------------------------"
-    );
+  Serial.println();
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "      AZURE GATEWAY READY"
+  );
+
+  Serial.println(
+    "================================"
+  );
+
+  Serial.println(
+    "Waiting for sensor data..."
+  );
+
+  printSeparator();
 }
 
 
 // ============================================================
-// Get Current UTC Timestamp
+// LOOP
 // ============================================================
 
-String getTimestamp()
-{
-    time_t now =
-        time(nullptr);
-
-
-    struct tm timeinfo;
-
-
-    gmtime_r(
-        &now,
-        &timeinfo
-    );
-
-
-    char buffer[32];
-
-
-    snprintf(
-        buffer,
-        sizeof(buffer),
-        "%04d-%02d-%02dT%02d:%02d:%02dZ",
-        timeinfo.tm_year + 1900,
-        timeinfo.tm_mon + 1,
-        timeinfo.tm_mday,
-        timeinfo.tm_hour,
-        timeinfo.tm_min,
-        timeinfo.tm_sec
-    );
-
-
-    return String(
-        buffer
-    );
-}
-
-
-// ============================================================
-// Receive Sensor Packet
-// ============================================================
-
-void receiveSensorData()
-{
-    int packetSize =
-        udp.parsePacket();
-
-
-    if (
-        packetSize <= 0
-    )
-    {
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // Read UDP packet
-    // --------------------------------------------------------
-
-    char packetBuffer[512];
-
-
-    int length =
-        udp.read(
-            packetBuffer,
-            sizeof(packetBuffer) - 1
-        );
-
-
-    if (
-        length <= 0
-    )
-    {
-        return;
-    }
-
-
-    packetBuffer[length] =
-        '\0';
-
-
-    String sensorPayload =
-        String(
-            packetBuffer
-        );
-
-
-    // --------------------------------------------------------
-    // Packet information
-    // --------------------------------------------------------
-
-    IPAddress senderIP =
-        udp.remoteIP();
-
-
-    unsigned int senderPort =
-        udp.remotePort();
-
-
-    receivedPackets++;
-
-    lastSensorPacketTime =
-        millis();
-
-
-    // --------------------------------------------------------
-    // Display received data
-    // --------------------------------------------------------
-
-    Serial.println();
-    Serial.println(
-        "================================"
-    );
-
-    Serial.println(
-        "    SENSOR DATA RECEIVED"
-    );
-
-    Serial.println(
-        "================================"
-    );
-
-
-    Serial.print(
-        "Source IP: "
-    );
-
-    Serial.println(
-        senderIP
-    );
-
-
-    Serial.print(
-        "Source port: "
-    );
-
-    Serial.println(
-        senderPort
-    );
-
-
-    Serial.print(
-        "Packet number: "
-    );
-
-    Serial.println(
-        receivedPackets
-    );
-
-
-    Serial.print(
-        "Sensor payload: "
-    );
-
-    Serial.println(
-        sensorPayload
-    );
-
-
-    // --------------------------------------------------------
-    // Basic sequence extraction
-    // --------------------------------------------------------
-
-    int sequencePosition =
-        sensorPayload.indexOf(
-            "\"sequence\":"
-        );
-
-
-    if (
-        sequencePosition >= 0
-    )
-    {
-        int valueStart =
-            sequencePosition +
-            11;
-
-
-        int valueEnd =
-            sensorPayload.indexOf(
-                ',',
-                valueStart
-            );
-
-
-        if (
-            valueEnd < 0
-        )
-        {
-            valueEnd =
-                sensorPayload.indexOf(
-                    '}',
-                    valueStart
-                );
-        }
-
-
-        if (
-            valueEnd > valueStart
-        )
-        {
-            String sequenceText =
-                sensorPayload.substring(
-                    valueStart,
-                    valueEnd
-                );
-
-
-            unsigned long sequence =
-                sequenceText.toInt();
-
-
-            Serial.print(
-                "Sequence number: "
-            );
-
-            Serial.println(
-                sequence
-            );
-
-
-            // ------------------------------------------------
-            // Detect duplicate/out-of-order sequence
-            // ------------------------------------------------
-
-            if (
-                sequence <=
-                lastSensorSequence
-            )
-            {
-                Serial.println();
-                Serial.println(
-                    "WARNING: DUPLICATE OR"
-                );
-
-                Serial.println(
-                    "OUT-OF-ORDER SEQUENCE!"
-                );
-
-                Serial.print(
-                    "Previous: "
-                );
-
-                Serial.println(
-                    lastSensorSequence
-                );
-
-                Serial.print(
-                    "Current: "
-                );
-
-                Serial.println(
-                    sequence
-                );
-            }
-
-
-            lastSensorSequence =
-                sequence;
-        }
-    }
-
-
-    // --------------------------------------------------------
-    // Build gateway-enriched telemetry
-    // --------------------------------------------------------
-
-    String gatewayTimestamp =
-        getTimestamp();
-
-
-    String finalPayload = "{";
-
-    finalPayload +=
-        "\"gateway_id\":\"";
-
-    finalPayload +=
-        GATEWAY_ID;
-
-    finalPayload += "\",";
-
-
-    finalPayload +=
-        "\"gateway_timestamp\":\"";
-
-    finalPayload +=
-        gatewayTimestamp;
-
-    finalPayload += "\",";
-
-
-    finalPayload +=
-        "\"source_ip\":\"";
-
-    finalPayload +=
-        senderIP.toString();
-
-    finalPayload += "\",";
-
-
-    finalPayload +=
-        "\"sensor_data\":";
-
-    finalPayload +=
-        sensorPayload;
-
-
-    finalPayload += "}";
-
-
-    // --------------------------------------------------------
-    // Display final telemetry
-    // --------------------------------------------------------
-
-    Serial.println();
-    Serial.println(
-        "Gateway-enriched payload:"
-    );
-
-    Serial.println(
-        finalPayload
-    );
-
-
-    // --------------------------------------------------------
-    // Publish to Azure
-    // --------------------------------------------------------
-
-    if (
-        mqttClient.connected()
-    )
-    {
-        bool published =
-            mqttClient.publish(
-                MQTT_TOPIC,
-                finalPayload.c_str(),
-                false
-            );
-
-
-        Serial.println();
-
-
-        if (
-            published
-        )
-        {
-            Serial.println(
-                "================================"
-            );
-
-            Serial.println(
-                " SENSOR → GATEWAY → AZURE PASS"
-            );
-
-            Serial.println(
-                "================================"
-            );
-
-
-            Serial.println(
-                "Sensor data accepted by gateway."
-            );
-
-            Serial.println(
-                "Sensor data published to Azure."
-            );
-        }
-        else
-        {
-            Serial.println(
-                "================================"
-            );
-
-            Serial.println(
-                " AZURE PUBLISH FAILED"
-            );
-
-            Serial.println(
-                "================================"
-            );
-
-
-            Serial.print(
-                "MQTT state: "
-            );
-
-            Serial.println(
-                mqttClient.state()
-            );
-        }
-    }
-    else
-    {
-        Serial.println();
-        Serial.println(
-            "WARNING: Azure MQTT is disconnected."
-        );
-    }
-
-
-    Serial.println(
-        "-------------------------------"
-    );
-}
-
-
-// ============================================================
-// Setup
-// ============================================================
-
-void setup()
-{
-    Serial.begin(
-        115200
-    );
-
-
-    delay(
-        1000
-    );
-
-
-    Serial.println();
-    Serial.println();
-
-
-    Serial.println(
-        "################################"
-    );
-
-    Serial.println(
-        "# Cross-Cloud Edge Trust"
-    );
-
-    Serial.println(
-        "# Azure Gateway - XIAO ESP32-C3"
-    );
-
-    Serial.println(
-        "################################"
-    );
-
-
-    // --------------------------------------------------------
-    // Wi-Fi
-    // --------------------------------------------------------
+void loop() {
+
+  // ----------------------------------------------------------
+  // Maintain Wi-Fi
+  // ----------------------------------------------------------
+
+  if (
+    WiFi.status() != WL_CONNECTED
+  ) {
 
     connectWiFi();
 
+    delay(1000);
 
-    if (
-        WiFi.status() != WL_CONNECTED
-    )
-    {
-        Serial.println(
-            "Stopping because Wi-Fi failed."
-        );
-
-        return;
-    }
+    return;
+  }
 
 
-    // --------------------------------------------------------
-    // NTP
-    // --------------------------------------------------------
+  // ----------------------------------------------------------
+  // Maintain MQTT
+  // ----------------------------------------------------------
 
-    if (
-        !synchronizeTime()
-    )
-    {
-        Serial.println(
-            "Stopping because time sync failed."
-        );
+  if (
+    !mqttClient.connected()
+  ) {
 
-        return;
-    }
+    connectToAzure();
+  }
+
+  mqttClient.loop();
 
 
-    // --------------------------------------------------------
-    // Azure MQTT
-    // --------------------------------------------------------
+  // ----------------------------------------------------------
+  // Receive sensor data
+  // ----------------------------------------------------------
 
-    if (
-        !connectAzure()
-    )
-    {
-        Serial.println();
-        Serial.println(
-            "Azure MQTT connection failed."
-        );
-
-        return;
-    }
+  receiveSensorData();
 
 
-    // --------------------------------------------------------
-    // UDP Sensor Receiver
-    // --------------------------------------------------------
-
-    startUDP();
-
-
-    Serial.println();
-    Serial.println(
-        "SYSTEM READY."
-    );
-
-    Serial.println(
-        "Waiting for Sensor Node #1..."
-    );
-}
-
-
-// ============================================================
-// Loop
-// ============================================================
-
-void loop()
-{
-    // --------------------------------------------------------
-    // Wi-Fi
-    // --------------------------------------------------------
-
-    if (
-        WiFi.status() != WL_CONNECTED
-    )
-    {
-        Serial.println(
-            "Wi-Fi disconnected."
-        );
-
-        connectWiFi();
-
-        delay(
-            1000
-        );
-
-        return;
-    }
-
-
-    // --------------------------------------------------------
-    // Azure MQTT
-    // --------------------------------------------------------
-
-    if (
-        !mqttClient.connected()
-    )
-    {
-        Serial.println(
-            "Azure MQTT disconnected."
-        );
-
-        if (
-            !connectAzure()
-        )
-        {
-            delay(
-                5000
-            );
-
-            return;
-        }
-    }
-
-
-    // --------------------------------------------------------
-    // MQTT processing
-    // --------------------------------------------------------
-
-    mqttClient.loop();
-
-
-    // --------------------------------------------------------
-    // Check for Sensor Node #1
-    // --------------------------------------------------------
-
-    receiveSensorData();
-
-
-    delay(
-        10
-    );
+  delay(10);
 }
