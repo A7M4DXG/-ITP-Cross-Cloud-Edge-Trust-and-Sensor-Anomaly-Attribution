@@ -33,3 +33,7 @@ data/processed/*
 # Temporary files
 *.tmp
 *.log
+
+# Local device/cloud credentials
+secrets.h
+credentials.h
