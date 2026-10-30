@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:itp:sensor-telemetry:1.0",
+  "title": "Sensor node UDP payload (current firmware)",
+  "type": "object",
+  "required": ["source_id", "sequence", "uptime_ms", "temperature", "humidity"],
+  "properties": {
+    "source_id": {"type": "string", "minLength": 1},
+    "sequence": {"type": "integer", "minimum": 0},
+    "uptime_ms": {"type": "integer", "minimum": 0},
+    "temperature": {"type": "number", "description": "Degrees Celsius; plausibility is evaluated separately"},
+    "humidity": {"type": "number", "description": "Relative humidity percent; plausibility is evaluated separately"}
+  },
+  "additionalProperties": false
+}

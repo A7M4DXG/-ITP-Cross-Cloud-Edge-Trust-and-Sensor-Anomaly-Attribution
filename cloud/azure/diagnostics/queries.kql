@@ -1,0 +1,29 @@
+// Cloud operational evidence, not the measurement dataset.
+AzureDiagnostics
+| where TimeGenerated > ago(24h)
+| where ResourceProvider =~ "MICROSOFT.DEVICES"
+| summarize Records=count(), Latest=max(TimeGenerated) by Category
+| order by Category asc
+
+// Run separately: connection events, including failure context columns.
+AzureDiagnostics
+| where TimeGenerated > ago(24h)
+| where ResourceProvider =~ "MICROSOFT.DEVICES" and Category == "Connections"
+| order by TimeGenerated desc
+| take 50
+
+// Run separately: service-side twin changes for manual collection control.
+AzureDiagnostics
+| where TimeGenerated > ago(24h)
+| where ResourceProvider =~ "MICROSOFT.DEVICES"
+| where Category in ("C2DTwinOperations", "D2CTwinOperations")
+| order by TimeGenerated desc
+| take 50
+
+// Run separately: routed telemetry errors/operations.
+AzureDiagnostics
+| where TimeGenerated > ago(24h)
+| where ResourceProvider =~ "MICROSOFT.DEVICES"
+| where Category in ("Routes", "DeviceTelemetry")
+| order by TimeGenerated desc
+| take 50

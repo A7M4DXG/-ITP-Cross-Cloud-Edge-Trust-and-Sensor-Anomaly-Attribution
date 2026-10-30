@@ -3,6 +3,9 @@
 #include <DHT.h>
 
 #include "secrets.h"
+#include "wifi_diagnostics.h"
+#include "../shared/sensor_discovery.h"
+#include <Preferences.h>
 
 
 // ============================================================
@@ -15,10 +18,11 @@
 // Gateway Configuration
 // ============================================================
 
-// XIAO #3 Azure Gateway IP
-const char* GATEWAY_IP = "192.168.100.63";
+// ITP Azure gateway private LAN address
+const char* GATEWAY_IP = SENSOR_GATEWAY_IPV4;
+IPAddress gatewayAddress;
 
-// UDP port used by XIAO #3
+// UDP intake port on the ITP Azure gateway
 const unsigned int GATEWAY_PORT = 5000;
 
 
@@ -63,6 +67,8 @@ const char* SENSOR_ID =
 // ============================================================
 
 unsigned long sequenceNumber = 0;
+Preferences sensorSequenceStore;
+bool sequenceStoreReady = false;
 
 
 // ============================================================
@@ -70,7 +76,7 @@ unsigned long sequenceNumber = 0;
 // ============================================================
 
 const unsigned long READING_INTERVAL =
-    5000;
+    SENSOR_SAMPLING_INTERVAL_MS;
 
 unsigned long lastReadingTime = 0;
 
@@ -79,18 +85,63 @@ unsigned long lastReadingTime = 0;
 // Connect to Wi-Fi
 // ============================================================
 
+const char* wifiStatusLabel(int status)
+{
+    switch (status)
+    {
+        case WL_CONNECTED:
+            return "connected";
+        case WL_NO_SSID_AVAIL:
+            return "network not found";
+        case WL_CONNECT_FAILED:
+            return "connection/authentication failed";
+        case WL_CONNECTION_LOST:
+            return "connection lost";
+        case WL_IDLE_STATUS:
+            return "idle";
+        case WL_DISCONNECTED:
+            return "disconnected";
+        default:
+            return "connecting or unknown";
+    }
+}
+
+
+void resetWiFiStation()
+{
+    // A timed-out ESP32 connection can remain in CONNECTING state. Reset the
+    // station before beginning a new attempt so WiFi.begin() is not rejected.
+    prepareWiFiDiagnostics();
+    WiFi.disconnect(false, false);
+    delay(250);
+    WiFi.mode(WIFI_OFF);
+    delay(250);
+    WiFi.mode(WIFI_STA);
+    delay(250);
+    WiFi.setSleep(false);
+    scanConfiguredWiFi(SENSOR_WIFI_SSID);
+}
+
+
 void connectWiFi()
 {
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        return;
+    }
+
+    if (!wifiRetryDue()) return;
+
     Serial.println();
     Serial.println("================================");
     Serial.println("       SENSOR NODE #1");
     Serial.println("================================");
 
-    WiFi.mode(WIFI_STA);
+    resetWiFiStation();
 
     WiFi.begin(
-        WIFI_SSID,
-        WIFI_PASSWORD
+        SENSOR_WIFI_SSID,
+        SENSOR_WIFI_PASSWORD
     );
 
     Serial.print(
@@ -117,6 +168,10 @@ void connectWiFi()
         WiFi.status() == WL_CONNECTED
     )
     {
+        reportWiFiSuccess();
+        // Bind UDP even when the first connection only succeeds from loop().
+        udp.stop();
+        if (!udp.begin(5001)) Serial.println("ERROR: UDP bind failed.");
         Serial.println(
             "Wi-Fi connected!"
         );
@@ -130,7 +185,7 @@ void connectWiFi()
         );
 
         Serial.print(
-            "Gateway IP: "
+            "Gateway address: "
         );
 
         Serial.println(
@@ -154,6 +209,27 @@ void connectWiFi()
         Serial.println(
             "Wi-Fi connection FAILED."
         );
+
+        Serial.print(
+            "Wi-Fi status: "
+        );
+
+        Serial.print(
+            wifiStatusLabel(WiFi.status())
+        );
+
+        Serial.print(
+            " ("
+        );
+
+        Serial.print(
+            WiFi.status()
+        );
+
+        Serial.println(
+            ")"
+        );
+        reportWiFiFailure();
     }
 
     Serial.println(
@@ -168,6 +244,13 @@ void connectWiFi()
 
 void sendSensorData()
 {
+    if (!sequenceStoreReady || !discoverAzureGateway(udp, gatewayAddress))
+    {
+        Serial.println("Gateway discovery failed or sequence storage unavailable; no sample sent.");
+        return;
+    }
+    Serial.print("Resolved gateway: ");
+    Serial.println(gatewayAddress);
     // --------------------------------------------------------
     // Read DHT11
     // --------------------------------------------------------
@@ -201,7 +284,17 @@ void sendSensorData()
     // Increment sequence number
     // --------------------------------------------------------
 
+    if (sequenceNumber == UINT32_MAX) {
+        Serial.println("Sequence counter exhausted; collection stopped.");
+        sequenceStoreReady = false;
+        return;
+    }
     sequenceNumber++;
+    if (sensorSequenceStore.putUInt("sequence", sequenceNumber) != sizeof(uint32_t)) {
+        Serial.println("Sequence persistence failed; collection stopped.");
+        sequenceStoreReady = false;
+        return;
+    }
 
 
     // --------------------------------------------------------
@@ -280,7 +373,7 @@ void sendSensorData()
     // --------------------------------------------------------
 
     udp.beginPacket(
-        GATEWAY_IP,
+        gatewayAddress,
         GATEWAY_PORT
     );
 
@@ -437,6 +530,12 @@ void setup()
     Serial.begin(
         115200
     );
+    sequenceStoreReady = sensorSequenceStore.begin(SENSOR_ID, false);
+    if (!sequenceStoreReady) {
+        Serial.println("Cannot open persistent sensor counter; collection stopped.");
+        return;
+    }
+    sequenceNumber = sensorSequenceStore.getUInt("sequence", 0);
 
     delay(
         1000
@@ -566,6 +665,7 @@ void setup()
 
 void loop()
 {
+    if (!sequenceStoreReady) { delay(1000); return; }
     // --------------------------------------------------------
     // Check Wi-Fi
     // --------------------------------------------------------
@@ -591,7 +691,7 @@ void loop()
 
 
     // --------------------------------------------------------
-    // Send reading every 5 seconds
+    // Send reading at the shared interval (40 seconds)
     // --------------------------------------------------------
 
     if (
@@ -599,10 +699,9 @@ void loop()
         READING_INTERVAL
     )
     {
+        // Schedule from the attempt start to avoid accumulating discovery latency.
+        lastReadingTime = millis();
         sendSensorData();
-
-        lastReadingTime =
-            millis();
     }
 
 

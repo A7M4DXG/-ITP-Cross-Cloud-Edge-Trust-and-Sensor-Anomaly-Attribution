@@ -1,0 +1,30 @@
+[
+  {
+    "category": "Connections",
+    "enabled": true
+  },
+  {
+    "category": "DeviceTelemetry",
+    "enabled": true
+  },
+  {
+    "category": "Routes",
+    "enabled": true
+  },
+  {
+    "category": "DeviceIdentityOperations",
+    "enabled": true
+  },
+  {
+    "category": "D2CTwinOperations",
+    "enabled": true
+  },
+  {
+    "category": "C2DTwinOperations",
+    "enabled": true
+  },
+  {
+    "category": "DirectMethods",
+    "enabled": true
+  }
+]

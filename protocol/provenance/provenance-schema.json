@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:itp:gateway-provenance:1.1",
+  "title": "Azure gateway formal telemetry and raw receipt evidence",
+  "type": "object",
+  "required": ["schema_version", "gateway"],
+  "properties": {
+    "schema_version": {"enum": ["1.0", "1.1"]},
+    "record_type": {"const": "gateway_receipt"},
+    "experiment_id": {"type": "string", "minLength": 1},
+    "receipt_id": {"type": "string", "minLength": 1},
+    "sampling_interval_ms": {"type": "integer", "minimum": 1},
+    "raw_sensor_payload_base64": {"type": "string", "contentEncoding": "base64"},
+    "packet_truncated": {"type": "boolean"},
+    "source": {
+      "type": "object",
+      "required": ["device_id", "sequence", "uptime_ms"],
+      "properties": {"device_id": {"type": "string"}, "sequence": {"type": "integer", "minimum": 0}, "uptime_ms": {"type": "integer", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "measurement": {
+      "type": "object",
+      "required": ["temperature", "humidity"],
+      "properties": {"temperature": {"type": "number"}, "humidity": {"type": "number"}},
+      "additionalProperties": false
+    },
+    "gateway": {
+      "type": "object",
+      "required": ["device_id", "received_at", "source_ip"],
+      "properties": {
+        "device_id": {"type": "string", "minLength": 1},
+        "received_at": {"type": "string", "format": "date-time"},
+        "source_ip": {"type": "string", "format": "ipv4"},
+        "boot_id": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "type": "object",
+      "required": ["sequence_status", "measurement_status", "overall_status"],
+      "properties": {
+        "sequence_status": {"enum": ["FIRST", "NORMAL", "REPLAY_OR_DUPLICATE", "SEQUENCE_GAP", "INVALID"]},
+        "measurement_status": {"enum": ["NORMAL", "OUT_OF_RANGE", "INVALID"]},
+        "overall_status": {"enum": ["ACCEPTED", "UNEXPECTED_SOURCE", "MEASUREMENT_ANOMALY", "REPLAY_CANDIDATE", "SEQUENCE_GAP", "MALFORMED"]}
+      },
+      "additionalProperties": false
+    }
+  },
+  "anyOf": [
+    {"required": ["source", "measurement", "validation"]},
+    {"required": ["record_type", "raw_sensor_payload_base64"], "properties": {"record_type": {"const": "gateway_receipt"}}}
+  ],
+  "allOf": [{
+    "if": {"properties": {"schema_version": {"const": "1.1"}}},
+    "then": {
+      "required": ["experiment_id", "receipt_id", "sampling_interval_ms", "raw_sensor_payload_base64", "packet_truncated"],
+      "properties": {"gateway": {"required": ["boot_id"]}}
+    }
+  }],
+  "additionalProperties": false
+}

@@ -5,6 +5,11 @@
 #include <time.h>
 
 #include "secrets.h"
+#include "wifi_diagnostics.h"
+#include "sensor_registry.h"
+#include "gateway_control.h"
+#include "gateway_discovery.h"
+#include <ESPmDNS.h>
 #include "azure_root_ca.h"
 
 #include "mbedtls/base64.h"
@@ -18,7 +23,7 @@
 // XIAO ESP32-C3 - Azure Gateway
 //
 // Flow:
-// Sensor Node #1
+// Sensor Nodes #1, #2 and #3
 //      |
 //      | UDP
 //      v
@@ -39,6 +44,7 @@
 
 WiFiClientSecure secureClient;
 PubSubClient mqttClient(secureClient);
+GatewayControl gatewayControl(mqttClient);
 
 
 // ============================================================
@@ -64,8 +70,7 @@ const char* AZURE_MQTT_TOPIC =
 
 const char* GATEWAY_ID = "azure-gateway-01";
 
-const char* EXPECTED_SENSOR_ID =
-    "sensor-node-01";
+// Accepted sources are listed in sensor_registry.h.
 
 
 // ============================================================
@@ -80,9 +85,7 @@ unsigned long rejectedCount = 0;
 unsigned long replayCandidateCount = 0;
 unsigned long sequenceGapCount = 0;
 
-unsigned long lastSensorSequence = 0;
-
-bool hasReceivedSequence = false;
+// Each sensor has its own sequence state in sensor_registry.h.
 
 
 // ============================================================
@@ -366,6 +369,11 @@ String generateSasToken() {
 
 bool connectToAzure() {
 
+  // SAS expiry and TLS validation require a usable UTC clock.
+  if (WiFi.status() != WL_CONNECTED || time(nullptr) < 1700000000) {
+    return false;
+  }
+
   if (mqttClient.connected()) {
     return true;
   }
@@ -421,6 +429,7 @@ bool connectToAzure() {
     Serial.println();
     Serial.println("Device authentication: PASS");
     Serial.println("MQTT connection: PASS");
+    gatewayControl.onConnected();
 
     return true;
 
@@ -678,41 +687,21 @@ bool validateSensorMessage(
   // Extract required fields
   // ----------------------------------------------------------
 
-  bool sourceOk =
-      extractStringField(
-        payload,
-        "source_id",
-        sourceId
-      );
-
-  bool sequenceOk =
-      extractUnsignedLongField(
-        payload,
-        "sequence",
-        sequence
-      );
-
-  bool uptimeOk =
-      extractUnsignedLongField(
-        payload,
-        "uptime_ms",
-        uptimeMs
-      );
-
-  bool temperatureOk =
-      extractFloatField(
-        payload,
-        "temperature",
-        temperature
-      );
-
-  bool humidityOk =
-      extractFloatField(
-        payload,
-        "humidity",
-        humidity
-      );
-
+  JsonDocument sensorDocument;
+  const bool jsonOk = !deserializeJson(sensorDocument, payload) &&
+                      sensorDocument.is<JsonObject>();
+  const bool sourceOk = jsonOk && sensorDocument["source_id"].is<const char*>() &&
+                        strlen(sensorDocument["source_id"].as<const char*>()) > 0 &&
+                        strlen(sensorDocument["source_id"].as<const char*>()) <= 32;
+  const bool sequenceOk = jsonOk && sensorDocument["sequence"].is<unsigned long>();
+  const bool uptimeOk = jsonOk && sensorDocument["uptime_ms"].is<unsigned long>();
+  const bool temperatureOk = jsonOk && sensorDocument["temperature"].is<float>();
+  const bool humidityOk = jsonOk && sensorDocument["humidity"].is<float>();
+  if (sourceOk) sourceId = sensorDocument["source_id"].as<const char*>();
+  if (sequenceOk) sequence = sensorDocument["sequence"].as<unsigned long>();
+  if (uptimeOk) uptimeMs = sensorDocument["uptime_ms"].as<unsigned long>();
+  if (temperatureOk) temperature = sensorDocument["temperature"].as<float>();
+  if (humidityOk) humidity = sensorDocument["humidity"].as<float>();
 
   // ----------------------------------------------------------
   // Required field validation
@@ -723,7 +712,9 @@ bool validateSensorMessage(
     !sequenceOk ||
     !uptimeOk ||
     !temperatureOk ||
-    !humidityOk
+    !humidityOk ||
+    !isfinite(temperature) ||
+    !isfinite(humidity)
   ) {
 
     sequenceStatus =
@@ -743,8 +734,8 @@ bool validateSensorMessage(
   // Source identity validation
   // ----------------------------------------------------------
 
-  bool sourceValid =
-      (sourceId == EXPECTED_SENSOR_ID);
+  const int sensorIndex = findSensorIndex(sourceId.c_str());
+  bool sourceValid = (sensorIndex >= 0);
 
 
   // ----------------------------------------------------------
@@ -776,30 +767,7 @@ bool validateSensorMessage(
   // Sequence validation
   // ----------------------------------------------------------
 
-  if (!hasReceivedSequence) {
-
-    sequenceStatus =
-        "FIRST";
-
-  } else if (
-    sequence <= lastSensorSequence
-  ) {
-
-    sequenceStatus =
-        "REPLAY_OR_DUPLICATE";
-
-  } else if (
-    sequence > lastSensorSequence + 1
-  ) {
-
-    sequenceStatus =
-        "SEQUENCE_GAP";
-
-  } else {
-
-    sequenceStatus =
-        "NORMAL";
-  }
+  sequenceStatus = classifySensorSequence(sensorIndex, sequence);
 
 
   // ----------------------------------------------------------
@@ -1027,6 +995,8 @@ void receiveSensorData() {
       String(incomingPacket);
 
 
+  if (replyToGatewayDiscovery(udp, sensorPayload)) return;
+
   packetCount++;
 
 
@@ -1115,8 +1085,7 @@ void receiveSensorData() {
   Serial.print("Source ID: ");
   Serial.println(sourceId);
 
-  Serial.print("Expected source: ");
-  Serial.println(EXPECTED_SENSOR_ID);
+  Serial.println("Allowed sources: sensor-node-01, sensor-node-02, sensor-node-03");
 
   Serial.print("Sequence: ");
   Serial.println(sequence);
@@ -1201,17 +1170,8 @@ void receiveSensorData() {
   // Update latest sequence
   // ----------------------------------------------------------
 
-  if (
-    !hasReceivedSequence ||
-    sequence > lastSensorSequence
-  ) {
-
-    lastSensorSequence =
-        sequence;
-
-    hasReceivedSequence =
-        true;
-  }
+  // Unknown sources and duplicate/older packets cannot advance node state.
+  recordSensorSequence(findSensorIndex(sourceId.c_str()), sequence);
 
 
   // ----------------------------------------------------------
@@ -1296,12 +1256,19 @@ void receiveSensorData() {
     "Publishing to Azure..."
   );
 
+  if (!gatewayControl.beforePublish(findSensorIndex(sourceId.c_str()), azurePayload.length())) {
+    Serial.println("Not forwarded: approval, source, cadence or daily budget gate.");
+    return;
+  }
+
   bool published =
       mqttClient.publish(
         AZURE_MQTT_TOPIC,
         azurePayload.c_str()
       );
 
+
+  gatewayControl.publishCompleted(published, findSensorIndex(sourceId.c_str()));
 
   if (published) {
 
@@ -1429,18 +1396,55 @@ void receiveSensorData() {
 // CONNECT WIFI
 // ============================================================
 
+const char* wifiStatusLabel(int status) {
+  switch (status) {
+    case WL_CONNECTED:
+      return "connected";
+    case WL_NO_SSID_AVAIL:
+      return "network not found";
+    case WL_CONNECT_FAILED:
+      return "connection/authentication failed";
+    case WL_CONNECTION_LOST:
+      return "connection lost";
+    case WL_IDLE_STATUS:
+      return "idle";
+    case WL_DISCONNECTED:
+      return "disconnected";
+    default:
+      return "connecting or unknown";
+  }
+}
+
+
+void resetWiFiStation() {
+  // A timed-out ESP32 connection can remain in CONNECTING state. Reset the
+  // station before beginning a new attempt so WiFi.begin() is not rejected.
+  prepareWiFiDiagnostics();
+  WiFi.disconnect(false, false);
+  delay(250);
+  WiFi.mode(WIFI_AP);
+  delay(250);
+  WiFi.mode(WIFI_AP_STA);
+  delay(250);
+  WiFi.setSleep(false);
+  scanConfiguredWiFi(WIFI_SSID);
+}
+
+
 void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
     return;
   }
 
+  if (!wifiRetryDue()) return;
+
   Serial.println();
   Serial.println(
     "Connecting to Wi-Fi..."
   );
 
-  WiFi.mode(WIFI_STA);
+  resetWiFiStation();
 
   WiFi.begin(
     WIFI_SSID,
@@ -1465,6 +1469,15 @@ void connectWiFi() {
 
   if (WiFi.status() == WL_CONNECTED) {
 
+    reportWiFiSuccess();
+    MDNS.end();
+    if (MDNS.begin(GATEWAY_MDNS_NAME)) MDNS.addService("itp", "udp", GATEWAY_UDP_PORT);
+    else Serial.println("mDNS unavailable; UDP broadcast discovery is still enabled.");
+    Serial.print("Gateway Wi-Fi MAC (for optional DHCP reservation): ");
+    Serial.println(WiFi.macAddress());
+    // Rebind UDP after reconnect, including an initially offline startup.
+    udp.stop();
+    if (!udp.begin(UDP_LISTEN_PORT)) Serial.println("ERROR: UDP bind failed.");
     Serial.println(
       "Wi-Fi connected!"
     );
@@ -1496,6 +1509,27 @@ void connectWiFi() {
     Serial.println(
       "Wi-Fi connection FAILED."
     );
+
+    Serial.print(
+      "Wi-Fi status: "
+    );
+
+    Serial.print(
+      wifiStatusLabel(WiFi.status())
+    );
+
+    Serial.print(
+      " ("
+    );
+
+    Serial.print(
+      WiFi.status()
+    );
+
+    Serial.println(
+      ")"
+    );
+    reportWiFiFailure();
   }
 }
 
@@ -1505,6 +1539,16 @@ void connectWiFi() {
 // ============================================================
 
 void synchronizeTime() {
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping time sync: Wi-Fi is disconnected.");
+    return;
+  }
+  static bool attempted = false;
+  static unsigned long lastAttempt = 0;
+  if (attempted && (unsigned long)(millis() - lastAttempt) < 30000) return;
+  attempted = true;
+  lastAttempt = millis();
 
   Serial.println();
   Serial.println(
@@ -1522,7 +1566,7 @@ void synchronizeTime() {
   int attempts = 0;
 
   while (
-    !getLocalTime(&timeinfo) &&
+    !getLocalTime(&timeinfo, 10) &&
     attempts < 30
   ) {
 
@@ -1535,7 +1579,7 @@ void synchronizeTime() {
 
   Serial.println();
 
-  if (getLocalTime(&timeinfo)) {
+  if (getLocalTime(&timeinfo, 10)) {
 
     Serial.println(
       "Time synchronized."
@@ -1585,7 +1629,7 @@ void setup() {
   );
 
   Serial.println(
-    "# Phase 2: Provenance + Validation"
+    "# 3 Nodes: Approval + Daily Budget"
   );
 
   Serial.println(
@@ -1597,7 +1641,21 @@ void setup() {
   // Wi-Fi
   // ----------------------------------------------------------
 
+  WiFi.mode(WIFI_AP_STA);
+  IPAddress sensorGateway;
+  sensorGateway.fromString(SENSOR_GATEWAY_IPV4);
+  if (strlen(SENSOR_WIFI_PASSWORD) < 12 || strlen(SENSOR_WIFI_PASSWORD) > 63 ||
+      !WiFi.softAPConfig(sensorGateway, sensorGateway, IPAddress(255, 255, 255, 0)) ||
+      !WiFi.softAP(SENSOR_WIFI_SSID, SENSOR_WIFI_PASSWORD, 1, false, SENSOR_NODE_COUNT)) {
+    Serial.println("ERROR: private sensor Wi-Fi could not start; fix configuration before collection.");
+    WiFi.softAPdisconnect(true);
+    while (true) delay(1000);
+  }
+  Serial.print("Private sensor network gateway: ");
+  Serial.println(WiFi.softAPIP());
+
   connectWiFi();
+  gatewayControl.begin();
 
 
   // ----------------------------------------------------------
@@ -1624,13 +1682,21 @@ void setup() {
   // ----------------------------------------------------------
 
   mqttClient.setBufferSize(
-    1024
+    4096
   );
+  mqttClient.setCallback([](char* topic, byte* payload, unsigned int length) {
+    gatewayControl.onMessage(topic, payload, length);
+  });
 
 
   // ----------------------------------------------------------
   // Time
   // ----------------------------------------------------------
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Network startup deferred: waiting for Wi-Fi before NTP and Azure.");
+    return;
+  }
 
   synchronizeTime();
 
@@ -1719,6 +1785,15 @@ void loop() {
   }
 
 
+  // Finish deferred clock initialization after an initially offline boot.
+  if (time(nullptr) < 1700000000) {
+    synchronizeTime();
+    if (time(nullptr) < 1700000000) {
+      delay(100);
+      return;
+    }
+  }
+
   // ----------------------------------------------------------
   // Maintain MQTT
   // ----------------------------------------------------------
@@ -1731,6 +1806,7 @@ void loop() {
   }
 
   mqttClient.loop();
+  gatewayControl.tick();
 
 
   // ----------------------------------------------------------

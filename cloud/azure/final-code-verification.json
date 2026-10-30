@@ -1,0 +1,42 @@
+{
+  "release": "ITP final code handoff",
+  "date": "2026-10-30",
+  "fqbn": "esp32:esp32:XIAO_ESP32C3",
+  "firmware": "itp-azure-3nodes-v1",
+  "builds": [
+    {
+      "sketch": "azure-gateway",
+      "compilation": "passed",
+      "programBytes": 1176005,
+      "sketchSha256": "fc5a0ecaa5853fa37549b3ad7d97b5882f4beac684d313fc01ce85f50b0ca80c"
+    },
+    {
+      "sketch": "sensor-node-01",
+      "compilation": "passed",
+      "programBytes": 957427,
+      "sketchSha256": "4f8e30e8b80416af7b3adb1d428dce84fc837477af9ab8ac2bd0d1450228c596"
+    },
+    {
+      "sketch": "sensor-node-02",
+      "compilation": "passed",
+      "programBytes": 957435,
+      "sketchSha256": "4c57a87fa8d110da9d3c63631426c13bc822b93def82114b9bc6a8193c828739"
+    },
+    {
+      "sketch": "sensor-node-03",
+      "compilation": "passed",
+      "programBytes": 957435,
+      "sketchSha256": "b03bdfa804e4991a7732b0a9661d731ad419461c9394f662419e3df268e830b5"
+    }
+  ],
+  "checks": [
+    "collection policy C++ tests passed",
+    "sensor registry C++ tests passed",
+    "approval watcher self-test passed",
+    "dataset label self-test passed",
+    "PowerShell syntax passed",
+    "staged credential scan passed"
+  ],
+  "hardwareUpload": "not performed in this handoff; user will flash boards",
+  "liveAcceptance": "required after flashing"
+}
